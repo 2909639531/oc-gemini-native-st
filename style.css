@@ -1,0 +1,75 @@
+.ocg-panel {
+    margin: 8px 0 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background: var(--SmartThemeBlurTintColor);
+}
+
+.ocg-panel-title {
+    font-weight: bold;
+    margin-bottom: 8px;
+    color: var(--SmartThemeEmColor);
+}
+
+.ocg-panel label {
+    display: block;
+    font-size: 0.9em;
+    margin: 6px 0 4px;
+    opacity: 0.85;
+}
+
+.ocg-key-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.ocg-key-row .text_pole {
+    flex: 1;
+    min-width: 0;
+}
+
+.ocg-key-row .menu_button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+.ocg-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    margin-top: 8px;
+}
+
+.ocg-actions .menu_button {
+    flex: 0 0 auto;
+}
+
+.ocg-actions .checkbox_label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin: 0;
+    font-size: 0.85em;
+    opacity: 0.85;
+}
+
+.ocg-hint {
+    display: block;
+    margin-top: 6px;
+    font-size: 0.8em;
+    opacity: 0.7;
+    line-height: 1.4;
+}
+
+#ocg_status_line:empty {
+    display: none;
+}
+
+#ocg_status_line {
+    margin-top: 8px;
+    font-size: 0.85em;
+    color: var(--SmartThemeQuoteColor);
+}
