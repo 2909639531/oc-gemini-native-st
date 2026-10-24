@@ -1,2 +1,2 @@
-relay/.session
-relay/key.txt
+*.backup-ocg-*
+node_modules/

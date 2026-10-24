@@ -1,12 +1,12 @@
 {
     "display_name": "OC Gemini Native (ST)",
-    "version": "2.0.0",
-    "author": "local",
-    "description": "SillyTavern only. Routes generation through the local relay to the Gemini generateContent protocol on OpenCode Go. Requires relay/relay.js to be running. No API key is stored in SillyTavern's config.",
+    "version": "3.0.0",
+    "author": "2909639531",
+    "description": "SillyTavern only. Routes generations through the Gemini generateContent protocol on OpenCode Go using the custom source (TT-style gemini_generate_content). No relay process. REQUIRES the one-file backend patch (ocg-backend.patch, apply with apply-backend-patch.cjs) — without it OpenCode requests will fail. API key is stored in SillyTavern's CUSTOM secret.",
     "loading_order": 95,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
-    "homePage": "https://opencode.ai/docs/go"
+    "homePage": "https://github.com/2909639531/oc-gemini-native-st"
 }

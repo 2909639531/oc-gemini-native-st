@@ -1,0 +1,316 @@
+--- chat-completions.js.backup-ocg-20261024	2026-10-24 12:08:51.185923300 +0800
++++ chat-completions.js	2026-10-24 12:25:19.496374600 +0800
+@@ -112,6 +112,57 @@
+ const enableAdaptiveThinking = getConfigValue('claude.enableAdaptiveThinking', true, 'boolean');
+ 
+ /**
++ * Host that only serves the Gemini generateContent protocol under OpenCode Go.
++ * Requests targeting it through the custom source are treated as OCG Gemini.
++ */
++const OCG_GEMINI_HOST = 'opencode.ai';
++
++/**
++ * OCG Gemini native compatibility.
++ * SillyTavern's custom source normally only speaks OpenAI Chat Completions.
++ * This marker routes the request through the existing Gemini converter while
++ * keeping the custom-source UI and custom secret storage.
++ * @param {any} body Request body
++ * @returns {boolean} True when the OpenCode Gemini native branch is requested
++ */
++function isOcgGeminiRequest(body) {
++    if (body?.chat_completion_source !== CHAT_COMPLETION_SOURCES.CUSTOM) {
++        return false;
++    }
++
++    // TauriTavern-style explicit marker. Its frontend sends this field natively.
++    if (body?.custom_api_format === 'gemini_generate_content') {
++        return true;
++    }
++
++    // Stock SillyTavern never sends custom_api_format (the field does not exist in
++    // public/scripts/openai.js), so also honor an explicit opt-in header marker and
++    // the dedicated OpenCode host.
++    if (typeof body?.custom_include_headers === 'string'
++        && /(^|\n)\s*x-ocg-gemini\s*:/i.test(body.custom_include_headers)) {
++        return true;
++    }
++
++    try {
++        const host = new URL(String(body?.custom_url || '')).hostname.toLowerCase();
++        return host === OCG_GEMINI_HOST || host.endsWith(`.${OCG_GEMINI_HOST}`);
++    } catch {
++        return false;
++    }
++}
++
++/**
++ * Build a stable OpenCode session id when the client did not provide one.
++ * @param {express.Request} request Express request
++ * @returns {string} OpenCode session id
++ */
++function getOcgSessionId(request) {
++    const seed = String(request.body.chat_id || request.body.custom_model || request.body.model || 'oc-gemini-native');
++    const hex = createHmac('sha256', getAffinityKey()).update(seed).digest('hex').slice(0, 32);
++    return `ses_${hex}`;
++}
++
++/**
+  * Lazily-cached HMAC key (instance cookie secret) for session-affinity hashing.
+  * @type {string|undefined}
+  */
+@@ -124,6 +175,103 @@
+ }
+ 
+ /**
++ * Translate a Gemini generateContent SSE stream into OpenAI chat-completion SSE.
++ * Stock SillyTavern parses the custom source with the OpenAI shape
++ * (`choices[0].delta.content`), while OpenCode returns Gemini native chunks, so the
++ * translation has to happen before the bytes reach the browser.
++ * @param {import('node-fetch').Response} generateResponse Upstream Gemini SSE response
++ * @param {express.Response} response Express response
++ * @param {string} model Model name reported back to the client
++ * @returns {Promise<void>}
++ */
++async function streamOcgGeminiAsOpenAI(generateResponse, response, model) {
++    const completionId = `chatcmpl-ocg-${Date.now().toString(36)}`;
++    const created = Math.floor(Date.now() / 1000);
++    const buildChunk = (delta, finishReason = null) => ({
++        id: completionId,
++        object: 'chat.completion.chunk',
++        created,
++        model,
++        choices: [{ index: 0, delta, finish_reason: finishReason }],
++    });
++
++    response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
++    response.setHeader('Cache-Control', 'no-cache, no-transform');
++    response.setHeader('Connection', 'keep-alive');
++    response.setHeader('X-Accel-Buffering', 'no');
++    response.flushHeaders();
++
++    const write = payload => response.write(`data: ${JSON.stringify(payload)}\n\n`);
++
++    const handlePayload = (payload) => {
++        const parts = payload?.candidates?.[0]?.content?.parts;
++        if (!Array.isArray(parts)) {
++            return;
++        }
++        const reasoning = parts.filter(part => part?.thought).map(part => part?.text ?? '').join('');
++        const content = parts.filter(part => !part?.thought).map(part => part?.text ?? '').join('');
++        if (reasoning) {
++            write(buildChunk({ reasoning_content: reasoning }));
++        }
++        if (content) {
++            write(buildChunk({ content }));
++        }
++    };
++
++    write(buildChunk({ role: 'assistant' }));
++
++    let buffer = '';
++    try {
++        for await (const raw of generateResponse.body) {
++            buffer += raw.toString('utf8');
++            const lines = buffer.split(/\r?\n/);
++            buffer = lines.pop() ?? '';
++            for (const line of lines) {
++                const trimmed = line.trim();
++                if (!trimmed.startsWith('data:')) {
++                    continue;
++                }
++                const payloadRaw = trimmed.slice(5).trim();
++                if (!payloadRaw || payloadRaw === '[DONE]') {
++                    continue;
++                }
++                let payload;
++                try {
++                    payload = JSON.parse(payloadRaw);
++                } catch {
++                    continue;
++                }
++                if (payload?.error) {
++                    write({ error: { message: payload.error?.message ?? 'OpenCode Go returned an error.' } });
++                    response.write('data: [DONE]\n\n');
++                    response.end();
++                    return;
++                }
++                handlePayload(payload);
++            }
++        }
++
++        const trailing = buffer.trim();
++        if (trailing.startsWith('data:')) {
++            const payloadRaw = trailing.slice(5).trim();
++            if (payloadRaw && payloadRaw !== '[DONE]') {
++                try {
++                    handlePayload(JSON.parse(payloadRaw));
++                } catch { /* ignore malformed trailing chunk */ }
++            }
++        }
++    } catch (error) {
++        console.warn('OpenCode Gemini stream interrupted:', error?.message ?? error);
++    } finally {
++        if (!response.writableEnded) {
++            write(buildChunk({}, 'stop'));
++            response.write('data: [DONE]\n\n');
++            response.end();
++        }
++    }
++}
++
++/**
+  * Cache for cacheable (writing) OpenRouter model IDs.
+  * @type {string[]}
+  */
+@@ -453,7 +601,8 @@
+  */
+ async function sendMakerSuiteRequest(request, response) {
+     const useVertexAi = request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.VERTEXAI;
+-    const apiName = useVertexAi ? 'Google Vertex AI' : 'Google AI Studio';
++    const isOcgGemini = request.body.__ocgGemini === true;
++    const apiName = useVertexAi ? 'Google Vertex AI' : (isOcgGemini ? 'OpenCode Go Gemini' : 'Google AI Studio');
+     let apiUrl;
+     let apiKey;
+ 
+@@ -472,6 +621,17 @@
+             console.warn(`${apiName} authentication failed: ${error.message}`);
+             return response.status(400).send({ error: true, message: error.message });
+         }
++    } else if (isOcgGemini) {
++        apiUrl = new URL(trimTrailingSlash(String(request.body.custom_url || '')));
++        apiKey = readSecret(request.user.directories, SECRET_KEYS.CUSTOM, request.body.secret_id);
++
++        if (!apiKey) {
++            console.warn(`${apiName} API key is missing.`);
++            return response.status(400).send({ error: true, message: 'OpenCode Go API key is missing.' });
++        }
++
++        authHeader = `Bearer ${apiKey}`;
++        authType = 'api_key';
+     } else {
+         apiUrl = new URL(request.body.reverse_proxy || API_MAKERSUITE);
+         apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.MAKERSUITE, request.body.secret_id);
+@@ -562,7 +722,19 @@
+             }
+         }
+ 
+-        const useSystemPrompt = !enableImageModality && !isGemma3 && request.body.use_sysprompt;
++        // The custom source never sends use_sysprompt (that checkbox only exists for
++        // makersuite/vertex/claude), so OCG always lifts system turns into systemInstruction.
++        const useSystemPrompt = !enableImageModality && !isGemma3 && (request.body.use_sysprompt || isOcgGemini);
++
++        // Gemini accepts at most 5 stop sequences and rejects empty ones.
++        if (isOcgGemini && Array.isArray(generationConfig.stopSequences)) {
++            generationConfig.stopSequences = generationConfig.stopSequences
++                .filter(seq => typeof seq === 'string' && seq.length > 0)
++                .slice(0, 5);
++            if (!generationConfig.stopSequences.length) {
++                delete generationConfig.stopSequences;
++            }
++        }
+ 
+         const tools = [];
+         const prompt = convertGooglePrompt(request.body.messages, model, useSystemPrompt, getPromptNames(request));
+@@ -619,6 +791,13 @@
+             }
+ 
+             generationConfig.thinkingConfig = thinkingConfig;
++        } else if (isOcgGemini && reasoningEffort && !['auto', 'none', 'undefined'].includes(reasoningEffort.toLowerCase())) {
++            // OpenCode exposes Gemini under an alias, so the normal Gemini model matcher
++            // does not recognize it. Pass the explicit thinking level through unchanged.
++            generationConfig.thinkingConfig = {
++                includeThoughts: includeReasoning,
++                thinkingLevel: reasoningEffort.toLowerCase(),
++            };
+         }
+ 
+         let body = {
+@@ -684,6 +863,20 @@
+             'Content-Type': 'application/json',
+         };
+ 
++        if (isOcgGemini) {
++            mergeObjectWithYaml(headers, request.body.custom_include_headers);
++            headers['Authorization'] = authHeader;
++            if (!Object.keys(headers).some(key => key.toLowerCase() === 'x-opencode-session')) {
++                headers['x-opencode-session'] = getOcgSessionId(request);
++            }
++            if (!Object.keys(headers).some(key => key.toLowerCase() === 'x-opencode-client')) {
++                headers['x-opencode-client'] = 'oc-gemini-native/3.0';
++            }
++            if (!Object.keys(headers).some(key => key.toLowerCase() === 'user-agent')) {
++                headers['user-agent'] = 'opencode/1.0 (oc-gemini-native)';
++            }
++        }
++
+         if (useVertexAi) {
+             if (authType === 'express') {
+                 // For Express mode (API key authentication), use the key parameter
+@@ -726,6 +919,9 @@
+                 url = `${apiUrl.toString().replace(/\/$/, '')}/v1/publishers/google/models/${model}:${responseType}${stream ? '?alt=sse' : ''}`;
+                 headers['Authorization'] = authHeader;
+             }
++        } else if (isOcgGemini) {
++            // OpenCode authenticates with the Authorization header; do not leak the key in the query string.
++            url = `${apiUrl.toString().replace(/\/$/, '')}/${apiVersion}/models/${model}:${responseType}${stream ? '?alt=sse' : ''}`;
+         } else {
+             url = `${apiUrl.toString().replace(/\/$/, '')}/${apiVersion}/models/${model}:${responseType}?key=${apiKey}${stream ? '&alt=sse' : ''}`;
+         }
+@@ -737,7 +933,18 @@
+             signal: controller.signal,
+         });
+ 
++        if (!generateResponse.ok) {
++            const errorText = await generateResponse.text();
++            console.warn(`${apiName} API returned error: ${generateResponse.status} ${generateResponse.statusText} ${errorText}`);
++            const errorJson = tryParse(errorText) ?? { error: true };
++            return response.status(generateResponse.status).send(errorJson);
++        }
++
+         if (stream) {
++            if (isOcgGemini) {
++                // OpenCode replies with Gemini native SSE, the custom source expects OpenAI SSE.
++                return await streamOcgGeminiAsOpenAI(generateResponse, response, model);
++            }
+             try {
+                 // Pipe remote SSE stream to Express response
+                 await forwardFetchResponse(generateResponse, response);
+@@ -1779,6 +1986,18 @@
+     try {
+         if (!request.body) return statusResponse.sendStatus(400);
+ 
++        // OpenCode Go has no Gemini model-list endpoint, so the generic custom
++        // /models probe always fails and paints the UI as disconnected. Report the
++        // configured model instead and mark the check as bypassed.
++        if (isOcgGeminiRequest(request.body)) {
++            const apiKey = readSecret(request.user.directories, SECRET_KEYS.CUSTOM, request.body.secret_id);
++            if (!apiKey) {
++                return statusResponse.send({ error: true, bypass: true, data: { data: [] } });
++            }
++            const modelId = String(request.body.model || request.body.custom_model || 'gemini-4-argon-contributor');
++            return statusResponse.send({ data: [{ id: modelId }], bypass: true });
++        }
++
+         let apiUrl = '';
+         let apiKey = '';
+         let headers = {};
+@@ -2256,6 +2475,19 @@
+             request.body.json_schema.value = flattenSchema(request.body.json_schema.value, request.body.chat_completion_source);
+         }
+ 
++        // OpenCode Go Gemini native: custom source + Gemini generateContent.
++        // This is the same transport model as TauriTavern's custom Gemini format.
++        if (isOcgGeminiRequest(request.body)) {
++            if (!request.body.custom_url || !request.body.custom_model) {
++                console.warn('OpenCode Gemini request is missing custom_url or custom_model.');
++                return response.status(400).send({ error: { message: 'OpenCode Gemini endpoint or model is missing.' } });
++            }
++            request.body.__ocgGemini = true;
++            request.body.model = String(request.body.custom_model);
++            request.body.chat_completion_source = CHAT_COMPLETION_SOURCES.MAKERSUITE;
++            return await sendMakerSuiteRequest(request, response);
++        }
++
+         switch (request.body.chat_completion_source) {
+             case CHAT_COMPLETION_SOURCES.CLAUDE: return await sendClaudeRequest(request, response);
+             case CHAT_COMPLETION_SOURCES.AI21: return await sendAI21Request(request, response);

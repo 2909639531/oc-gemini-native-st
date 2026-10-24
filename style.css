@@ -73,3 +73,23 @@
     font-size: 0.85em;
     color: var(--SmartThemeQuoteColor);
 }
+
+/* 后端补丁未应用时的红色警示块（从 Git 装扩展最常见的问题） */
+.ocg-patch-warning {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border: 1px solid #d9534f;
+    border-left-width: 3px;
+    border-radius: 4px;
+    background: rgba(217, 83, 79, 0.12);
+    font-size: 0.82em;
+    line-height: 1.5;
+}
+
+.ocg-patch-warning code {
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.25);
+    font-size: 0.95em;
+    word-break: break-all;
+}
